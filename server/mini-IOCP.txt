@@ -1,0 +1,75 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <iostream>
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "mswsock.lib")
+
+HANDLE g_iocp;
+SOCKET g_listen;
+
+struct IO {
+    OVERLAPPED ov;
+    char buf[4096];
+    SOCKET client;
+    int type; // 0=accept, 1=recv
+};
+
+bool PostAccept() {
+    IO* io = new IO();
+    io->type = 0;
+    io->client = socket(AF_INET, SOCK_STREAM, 0);
+    DWORD bytes;
+    AcceptEx(g_listen, io->client, io->buf, 0,
+             sizeof(sockaddr_in)+16, sizeof(sockaddr_in)+16,
+             &bytes, &io->ov);
+    return true;
+}
+
+bool PostRecv(SOCKET client) {
+    IO* io = new IO();
+    io->type = 1;
+    io->client = client;
+    DWORD flags = 0, bytes;
+    WSARecv(client, &(WSABUF){4096, io->buf}, 1, &bytes, &flags, &io->ov, NULL);
+    return true;
+}
+
+DWORD WINAPI Worker(LPVOID) {
+    while (true) {
+        DWORD bytes;
+        ULONG_PTR key;
+        LPOVERLAPPED pov;
+        GetQueuedCompletionStatus(g_iocp, &bytes, &key, &pov, INFINITE);
+        IO* io = CONTAINING_RECORD(pov, IO, ov);
+        if (io->type == 0) {
+            CreateIoCompletionPort((HANDLE)io->client, g_iocp, 0, 0);
+            std::cout << "新客户端\n";
+            PostRecv(io->client);
+            PostAccept();
+        } else {
+            if (bytes == 0) {
+                closesocket(io->client);
+            } else {
+                std::cout << "收到: " << std::string(io->buf, bytes) << "\n";
+                PostRecv(io->client);
+            }
+        }
+        delete io;
+    }
+}
+
+int main() {
+    WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
+    g_listen = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(9000); a.sin_addr.s_addr=INADDR_ANY;
+    bind(g_listen, (sockaddr*)&a, sizeof(a));
+    listen(g_listen, SOMAXCONN);
+    g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    CreateIoCompletionPort((HANDLE)g_listen, g_iocp, 0, 0);
+    PostAccept();
+    for (int i = 0; i < 4; ++i) CreateThread(NULL, 0, Worker, NULL, 0, NULL);
+    std::cout << "服务器启动\n";
+    std::cin.get();
+    return 0;
+}

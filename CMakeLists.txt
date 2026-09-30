@@ -4,9 +4,13 @@ project(tcp_demo CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Windows 下需要链接 Winsock2
+# MSVC 下强制按 UTF-8 解析源文件
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 if(WIN32)
-    set(PLATFORM_LIBS ws2_32)
+    set(PLATFORM_LIBS ws2_32 mswsock)
 else()
     set(PLATFORM_LIBS)
 endif()

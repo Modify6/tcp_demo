@@ -1,178 +1,315 @@
 #include "../common/net_utils.h"
 #include <iostream>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <queue>
-#include <atomic>
+#include <vector>
+#include <string>
 
-// =========================================================================
-// 1. 数据结构（与发送方一致）
-// =========================================================================
-struct Player {
-    int32_t id;
-    int32_t level;
-    float x;
-    float y;
-    float hp;
-    float mp;
-    char name[32];
-    char guild[32];
-};
+//整体架构图
+//┌──────────────────────────────────────────────┐
+//│               主线程(main)                   │
+//│  1. 创建监听 Socket                           │
+//│  2. 创建 IOCP 完成端口                         │
+//│  3. 把监听 Socket 绑定到 IOCP                  │
+//│  4. 预投递 4 个 AcceptEx                       │
+//│  5. 创建 N 个工作线程                          │
+//│  6. 阻塞等待退出                              │
+//└──────────────────────────────────────────────┘
+//                                            │
+//                                            │ 创建 N 个
+//                                            ▼
+//┌──────────────────────────────────────────────┐
+//│      工作线程池(WorkerThread × N)             │
+//│  循环 : GetQueuedCompletionStatus              │
+//│        ├─ IO_ACCEPT → 绑定新客户端 + PostRecv │
+//│        └─ IO_RECV   → 切包 + 反序列化 + PostRecv│
+//└──────────────────────────────────────────────┘
+//                                             ▲
+//                                             │ 完成事件
+//                                             │
+//┌──────────────────────────────────────────────┐
+//│          内核 IOCP 完成队列                    │
+//│  由 Windows 内核维护，保存所有 I / O 完成事件     │
+//└──────────────────────────────────────────────┘
+//                                              ▲
+//                                              │ 异步投递
+//                                              │
+//┌──────────────────────────────────────────────┐
+//│  AcceptEx / WSARecv 异步操作                  │
+//└──────────────────────────────────────────────┘
 
-// =========================================================================
-// 2. 反序列化（只在接收线程里调用）
-// =========================================================================
-Player deserialize(const std::string& buf) {
-    ByteReader reader(buf);
-    Player p;
-    p.id = reader.read_int32();
-    p.level = reader.read_int32();
-    p.x = reader.read_float();
-    p.y = reader.read_float();
-    p.hp = reader.read_float();
-    p.mp = reader.read_float();
-    reader.read_cstr(p.name, 32);
-    reader.read_cstr(p.guild, 32);
-    return p;
-}
+#define MAX_BUFFER_SIZE 4096
+#define SERVER_PORT 9000
 
-// =========================================================================
-// 3. 线程安全队列（生产者-消费者模型）
-// =========================================================================
-template<typename T>
-class SafeQueue {
-    std::queue<T> queue_;
-    std::mutex mutex_;
-    std::condition_variable cond_;
-    bool stopped_ = false;
+// ================= 上下文结构 =================
+enum IO_TYPE { IO_ACCEPT, IO_RECV };
 
-public:
-    void push(T item) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            queue_.push(std::move(item));
-        }
-        cond_.notify_one(); // 有数据了，唤醒消费者
-    }
+struct ClientContext;
 
-    bool pop(T& item) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        // 等待：队列有数据，或者被要求停止
-        cond_.wait(lock, [this] { return !queue_.empty() || stopped_; });
-        if (queue_.empty()) return false; // 被停止且没数据了
-        item = std::move(queue_.front());
-        queue_.pop();
-        return true;
-    }
+struct IOContext {
+    OVERLAPPED overlapped;       // 必须放在首位
+    WSABUF wsabuf;
+    char buffer[MAX_BUFFER_SIZE];
+    IO_TYPE ioType;
+    SOCKET clientSocket;
+    ClientContext* clientCtx;    // 指向该客户端的上下文（Recv 时使用）
 
-    void stop() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopped_ = true;
-        }
-        cond_.notify_all(); // 唤醒所有等待者，让它们退出
+    IOContext() {
+        ZeroMemory(&overlapped, sizeof(overlapped));
+        ZeroMemory(buffer, MAX_BUFFER_SIZE);
+        wsabuf.buf = buffer;
+        wsabuf.len = MAX_BUFFER_SIZE;
+        ioType = IO_RECV;
+        clientSocket = INVALID_SOCKET;
+        clientCtx = nullptr;
     }
 };
 
-// =========================================================================
-// 4. 接收线程函数
-// =========================================================================
-void recv_thread_func(socket_t fd, SafeQueue<Player>& queue, std::atomic<bool>& running) {
-    printf("[recv_thread] 接收线程启动\n");
+struct ClientContext {
+    SOCKET socket;
+    std::string recvBuffer;  // 每个客户端独立的粘包/拆包缓冲区
 
-    while (running) {
-        // 4.1 先收 4 字节长度头
-        uint32_t net_len;
-        if (!recv_all(fd, &net_len, 4)) {
-            printf("[recv_thread] 对端关闭或出错，退出接收循环\n");
-            break;
-        }
-        uint32_t len = ntohl(net_len);
-        // 4.2 根据长度收 payload
-        std::string payload(len, '\0');
-        if (!recv_all(fd, payload.data(), len)) {
-            printf("[recv_thread] payload 接收失败\n");
-            break;
-        }
+    ClientContext(SOCKET s) : socket(s) {}
+};
 
-        // 4.3 反序列化
-        Player p = deserialize(payload);
+// ================= 全局变量 =================
+HANDLE g_hIOCP = INVALID_HANDLE_VALUE;
+SOCKET g_listenSocket = INVALID_SOCKET;
 
-        // 4.4 塞进队列，唤醒主线程处理
-        queue.push(p);
-        printf("[recv_thread] 收到一条消息，已放入队列\n");
-    }
+// ================= 从 recvBuffer 里切出一条完整消息 =================
+// 协议: [4字节长度头(网络序)] [payload]
+// 返回 true 说明切出一条完整消息，outPayload 里是 payload
+bool TryExtractMessage(ClientContext* ctx, std::string& outPayload) {
+    if (ctx->recvBuffer.size() < 4) return false;
 
-    // 4.5 通知主线程：接收结束了
-    running = false;
-    queue.stop();
-    printf("[recv_thread] 接收线程退出\n");
+    uint32_t net_len;
+    memcpy(&net_len, ctx->recvBuffer.data(), 4);
+    uint32_t len = ntohl(net_len);
+
+    if (ctx->recvBuffer.size() < 4 + len) return false;
+
+    outPayload.assign(ctx->recvBuffer.data() + 4, len);
+    ctx->recvBuffer.erase(0, 4 + len);
+    return true;
 }
 
-// =========================================================================
-// 5. 主函数
-// =========================================================================
+// ================= 投递异步 Accept =================
+bool PostAccept() {
+    IOContext* ioCtx = new IOContext();
+    ioCtx->ioType = IO_ACCEPT;
+    ioCtx->clientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ioCtx->clientSocket == INVALID_SOCKET) {
+        delete ioCtx;
+        return false;
+    }
+
+    DWORD bytesReceived = 0;
+    BOOL ok = AcceptEx(
+        g_listenSocket,
+        ioCtx->clientSocket,
+        ioCtx->buffer,
+        0,
+        sizeof(sockaddr_in) + 16,
+        sizeof(sockaddr_in) + 16,
+        &bytesReceived,
+        &ioCtx->overlapped
+    );
+
+    if (ok == FALSE) {
+        int err = WSAGetLastError();
+        if (err != ERROR_IO_PENDING) {
+            std::cerr << "AcceptEx 失败: " << err << std::endl;
+            closesocket(ioCtx->clientSocket);
+            delete ioCtx;
+            return false;
+        }
+    }
+    return true;
+}
+
+// ================= 投递异步 Recv =================
+bool PostRecv(ClientContext* clientCtx) {
+    IOContext* ioCtx = new IOContext();
+    ioCtx->ioType = IO_RECV;
+    ioCtx->clientSocket = clientCtx->socket;
+    ioCtx->clientCtx = clientCtx;
+
+    DWORD flags = 0;
+    DWORD bytesReceived = 0;
+
+    int ret = WSARecv(
+        clientCtx->socket,
+        &ioCtx->wsabuf,
+        1,
+        &bytesReceived,
+        &flags,
+        &ioCtx->overlapped,
+        NULL
+    );
+
+    if (ret == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSA_IO_PENDING) {
+            std::cerr << "WSARecv 失败: " << err << std::endl;
+            delete ioCtx;
+            return false;
+        }
+    }
+    return true;
+}
+
+// ================= 工作线程 =================
+DWORD WINAPI WorkerThread(LPVOID) {
+    while (true) {
+        DWORD bytesTransferred = 0;
+        ULONG_PTR completionKey = 0;
+        LPOVERLAPPED lpOverlapped = NULL;
+
+        BOOL ok = GetQueuedCompletionStatus(
+            g_hIOCP,
+            &bytesTransferred,
+            &completionKey,
+            &lpOverlapped,
+            INFINITE
+        );
+
+        if (!ok) {
+            std::cerr << "GetQueuedCompletionStatus 失败: " << GetLastError() << std::endl;
+            continue;
+        }
+
+        // 反推 IOContext
+        IOContext* ioCtx = CONTAINING_RECORD(lpOverlapped, IOContext, overlapped);
+
+        switch (ioCtx->ioType) {
+        case IO_ACCEPT: {
+            // 新客户端连接
+            ClientContext* clientCtx = new ClientContext(ioCtx->clientSocket);
+
+            // 绑定到 IOCP，completionKey 用 clientCtx 指针
+            CreateIoCompletionPort(
+                (HANDLE)ioCtx->clientSocket,
+                g_hIOCP,
+                (ULONG_PTR)clientCtx,
+                0
+            );
+
+            std::cout << "[IOCP] 接受新客户端连接" << std::endl;
+
+            // 为该客户端投递第一次 Recv
+            PostRecv(clientCtx);
+
+            // 重新投递 Accept，等待下一个客户端
+            PostAccept();
+
+            // 释放本次 Accept 的 IOContext（注意：clientSocket 已交给 clientCtx，不要 close）
+            delete ioCtx;
+            break;
+        }
+        case IO_RECV: {
+            ClientContext* clientCtx = ioCtx->clientCtx;
+
+            // 客户端断开
+            if (bytesTransferred == 0) {
+                std::cout << "[IOCP] 客户端断开连接" << std::endl;
+                closesocket(clientCtx->socket);
+                delete clientCtx;
+                delete ioCtx;
+                continue;
+            }
+
+            // 1. 把本次收到的数据追加到该客户端的 recvBuffer
+            clientCtx->recvBuffer.append(ioCtx->buffer, bytesTransferred);
+
+            // 2. 循环切出所有完整消息
+            std::string payload;
+            while (TryExtractMessage(clientCtx, payload)) {
+                // 3. 反序列化（和阻塞版本完全一样！）
+                Player p = deserialize(payload);
+
+                // 4. 处理业务
+                std::cout << "[IOCP] 收到一条 Player 消息:" << std::endl;
+                std::cout << "  -> ID:    " << p.id << std::endl;
+                std::cout << "  -> Level: " << p.level << std::endl;
+                std::cout << "  -> X:     " << p.x << std::endl;
+                std::cout << "  -> Y:     " << p.y << std::endl;
+                std::cout << "  -> HP:    " << p.hp << std::endl;
+                std::cout << "  -> MP:    " << p.mp << std::endl;
+                std::cout << "  -> Name:  " << p.name << std::endl;
+                std::cout << "  -> Guild: " << p.guild << std::endl;
+                std::cout << "----------------------------------------" << std::endl;
+            }
+
+            // 5. 继续投递下一次 Recv
+            PostRecv(clientCtx);
+
+            // 6. 释放本次 Recv 的 IOContext
+            delete ioCtx;
+            break;
+        }
+        }
+    }
+    return 0;
+}
+
+// ================= 主函数 =================
 int main() {
 #ifdef _WIN32
     system("chcp 65001 > nul");
 #endif
     if (!init_network()) return 1;
 
-    // -------- 5.1 建立监听、接受连接 --------
-    socket_t listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    // 1. 创建监听 Socket
+    g_listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    setsockopt(g_listenSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(9000);
+    addr.sin_port = htons(SERVER_PORT);
 
-    if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        printf("bind 失败\n");
+    if (bind(g_listenSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        std::cerr << "bind 失败: " << WSAGetLastError() << std::endl;
         return 1;
     }
-    listen(listen_fd, 1);
-    printf("[server] 监听 9000，等待连接...\n");
+    listen(g_listenSocket, SOMAXCONN);
+    std::cout << "[IOCP] 服务器监听端口 " << SERVER_PORT << std::endl;
 
-    socket_t fd = accept(listen_fd, nullptr, nullptr);
-    printf("[server] 客户端已连接\n\n");
-
-    // -------- 5.2 启动接收线程 --------
-    SafeQueue<Player> queue;             // 线程安全队列
-    std::atomic<bool> running{ true };     // 标志位：接收线程是否继续
-
-    // 创建线程：传入 socket 描述符、队列引用、running 标志引用
-    std::thread recv_thread(recv_thread_func, fd, std::ref(queue), std::ref(running));
-
-    // -------- 5.3 主线程：消费队列 --------
-    printf("[main] 主线程开始消费队列...\n");
-    Player p;
-    while (queue.pop(p)) {
-        // 这里就是主线程的业务逻辑
-        printf("[main] 处理一条消息:\n");
-        printf("  -> ID:    %d\n", p.id);
-        printf("  -> Level: %d\n", p.level);
-        printf("  -> X:     %.2f\n", p.x);
-        printf("  -> Y:     %.2f\n", p.y);
-        printf("  -> HP:    %.2f\n", p.hp);
-        printf("  -> MP:    %.2f\n", p.mp);
-        printf("  -> Name:  %s\n", p.name);
-        printf("  -> Guild: %s\n", p.guild);
-        printf("----------------------------------------\n");
+    // 2. 创建完成端口
+    g_hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (g_hIOCP == NULL) {
+        std::cerr << "CreateIoCompletionPort 失败" << std::endl;
+        return 1;
     }
 
-    printf("[main] 队列已停止，主线程退出\n");
+    // 3. 将监听 Socket 绑定到完成端口（completionKey 传监听 Socket）
+    CreateIoCompletionPort((HANDLE)g_listenSocket, g_hIOCP, (ULONG_PTR)g_listenSocket, 0);
 
-    // -------- 5.4 清理 --------
-    running = false;
-    if (recv_thread.joinable()) {
-        recv_thread.join(); // 等待接收线程退出
+    // 4. 预投递多个 Accept
+    for (int i = 0; i < 4; ++i) {
+        PostAccept();
     }
 
-    CLOSE_SOCKET(fd);
-    CLOSE_SOCKET(listen_fd);
+    // 5. 创建工作线程池
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    int threadCount = sysInfo.dwNumberOfProcessors * 2;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < threadCount; ++i) {
+        threads.emplace_back(WorkerThread, nullptr);
+    }
+    std::cout << "[IOCP] 启动 " << threadCount << " 个工作线程" << std::endl;
+
+    // 6. 主线程等待
+    std::cout << "[IOCP] 按回车键退出..." << std::endl;
+    std::cin.get();
+
+    // 7. 清理（简化处理）
+    for (auto& t : threads) {
+        if (t.joinable()) t.detach();
+    }
+    closesocket(g_listenSocket);
+    CloseHandle(g_hIOCP);
     cleanup_network();
     return 0;
 }
