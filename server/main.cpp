@@ -14,8 +14,8 @@
 // =========================================================================
 // 全局统计（多线程共享，必须用 atomic 或 mutex 保护）
 // =========================================================================
-std::atomic<int> g_clientIdCounter{ 0 };   // 客户端 ID 递增计数器
-std::atomic<int> g_onlineClients{ 0 };     // 当前在线客户端数
+std::atomic<int> g_clientIdCounter{ 0 };     // 客户端 ID 递增计数器
+std::atomic<int> g_onlineClients{ 0 };       // 当前在线客户端数
 std::atomic<long long> g_totalMessages{ 0 }; // 服务器累计收到的消息数
 std::atomic<long long> g_totalBytes{ 0 };    // 服务器累计收到的字节数
 
@@ -101,6 +101,7 @@ SOCKET g_listenSocket = INVALID_SOCKET;
 
 // =========================================================================
 // 从 recvBuffer 切出一条完整消息
+// 协议: [4字节长度头(网络序)] [payload]
 // =========================================================================
 bool TryExtractMessage(ClientContext* ctx, std::string& outPayload) {
     if (ctx->recvBuffer.size() < 4) return false;
@@ -202,10 +203,29 @@ DWORD WINAPI WorkerThread(LPVOID) {
             INFINITE
         );
 
+        // ================= 关键修复：处理异常完成包 =================
+        // 说明：
+        //   1. lpOverlapped == NULL：真正的 IOCP 系统错误，跳过。
+        //   2. lpOverlapped != NULL 且 !ok：客户端异常断开（如 ERROR_NETNAME_DELETED=64），
+        //      系统取消挂起的 WSARecv。此时必须强制走断开清理流程，
+        //      否则 IOContext / ClientContext / Socket 会全部泄漏。
+        bool abnormalDisconnect = false;
+        int errorCode = 0;
+
         if (!ok) {
-            LogPrint("[ERROR] GetQueuedCompletionStatus 失败: ", GetLastError());
-            continue;
+            errorCode = GetLastError();
+
+            if (lpOverlapped == NULL) {
+                // 真正的系统级错误
+                LogPrint("[ERROR] GetQueuedCompletionStatus 系统错误: ", errorCode);
+                continue;
+            }
+
+            // 有完成包但操作失败 —— 属于客户端异常断开
+            abnormalDisconnect = true;
+            bytesTransferred = 0; // 强制走断开清理分支
         }
+        // ==========================================================
 
         IOContext* ioCtx = CONTAINING_RECORD(lpOverlapped, IOContext, overlapped);
 
@@ -252,17 +272,22 @@ DWORD WINAPI WorkerThread(LPVOID) {
         }
 
                       // =============================================================
-                      // Recv 完成：收到数据
+                      // Recv 完成：收到数据 / 客户端断开
                       // =============================================================
         case IO_RECV: {
             ClientContext* clientCtx = ioCtx->clientCtx;
 
-            // 客户端断开
+            // ---------- 客户端断开（正常或异常） ----------
             if (bytesTransferred == 0) {
                 g_onlineClients--;
 
                 LogPrint("============================================================");
-                LogPrint("[DISCONNECT] 客户端断开");
+                if (abnormalDisconnect) {
+                    LogPrint("[DISCONNECT] 客户端异常断开 (错误码 ", errorCode, ")");
+                }
+                else {
+                    LogPrint("[DISCONNECT] 客户端正常断开");
+                }
                 LogPrint("  -> 客户端 ID  : #", clientCtx->id);
                 LogPrint("  -> IP 地址    : ", clientCtx->ip, ":", clientCtx->port);
                 LogPrint("  -> 累计消息数 : ", clientCtx->msgCount);
@@ -276,7 +301,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
                 continue;
             }
 
-            // 更新字节统计
+            // ---------- 正常收到数据 ----------
             clientCtx->byteCount += bytesTransferred;
             g_totalBytes += bytesTransferred;
 
